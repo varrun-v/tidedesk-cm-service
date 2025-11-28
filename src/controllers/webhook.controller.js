@@ -1,20 +1,26 @@
 import db from '../services/db.service.js';
 
 export async function handleAiosellBooking(req, res) {
-    const payload = req.body;
-
-    // 0. SECURITY: Verify Signature
-    const signature = req.headers['x-aiosell-token'];
-    if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
-        console.warn("Unauthorized Webhook Attempt");
-        return res.status(403).json({ success: false, error: "Unauthorized" });
-    }
-
-    // 1. LOG IT (Safety First)
-    await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
-        ['/webhook/aiosell', JSON.stringify(payload), 200]);
-
     try {
+        const payload = req.body;
+
+        // 0. SECURITY: Verify Signature
+        const signature = req.headers['x-aiosell-token'];
+        if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
+            console.warn("Unauthorized Webhook Attempt");
+            return res.status(403).json({ success: false, error: "Unauthorized" });
+        }
+
+        // 1. LOG IT (Safety First)
+        // We wrap this in its own try/catch so logging failure doesn't block the booking
+        try {
+            await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
+                ['/webhook/aiosell', JSON.stringify(payload), 200]);
+        } catch (logErr) {
+            console.error("Failed to log webhook:", logErr.message);
+            // Continue processing even if logging fails
+        }
+
         const reservationId = payload.bookingId || payload.reservationId;
         const action = payload.action || 'book'; // 'book', 'modify', 'cancel'
 
