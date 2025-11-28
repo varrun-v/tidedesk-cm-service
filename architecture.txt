@@ -1,0 +1,696 @@
+---
+
+## 📄 What Aiosell docs require — what to map to your DB
+
+Based on the documentation:
+
+* They support not just **inventory** and **rates**, but also
+  → **rate restrictions** / **inventory restrictions** (min stay, stop-sell, close on arrival/departure, advance-reservation rules) ([Aiosell Support Helpdesk][1])
+* The “reservation push” payload (when Aiosell sends bookings to PMS) includes a fairly complex structure:
+
+  * Booking metadata (bookingId, cmBookingId) ([Aiosell Support Helpdesk][2])
+  * Guest data (firstName, lastName, email, phone, address, etc.) ([Aiosell Support Helpdesk][2])
+  * Room-level details (roomCode, rateplanCode, occupancy, dates per night, price per date) ([Aiosell Support Helpdesk][2])
+  * Amount breakdown (before tax, tax, currencies, etc.) ([Aiosell Support Helpdesk][2])
+  * Action flags (book / modify / cancel) ([Aiosell Support Helpdesk][2])
+
+This means your PMS — and microservice — must be ready to store and process data considerably more detailed than “just stay + basic guest info.”
+
+---
+
+## 🧱 What to Add to Your Database — Extended Schema (or new tables)
+
+Here are the additional/modified tables & fields you should add now, anticipating full Aiosell integration:
+
+### **1. room_rate_plans** (if not already)
+
+To support multiple “rateplanCode” per room — because OTA may send different rateplan codes than your internal ones.
+
+```sql
+CREATE TABLE room_rate_plans (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  room_type VARCHAR(100),
+  rateplan_code VARCHAR(100) UNIQUE,
+  description VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### **2. inventory_restrictions**
+
+To store stop-sell / min-stay / close-on-arrival / advance-booking restrictions set via PMS → Aiosell, or vice versa.
+
+```sql
+CREATE TABLE inventory_restrictions (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  room_type VARCHAR(100),
+  start_date DATE,
+  end_date DATE,
+  stop_sell BOOLEAN DEFAULT FALSE,
+  minimum_stay INT DEFAULT NULL,
+  close_on_arrival BOOLEAN DEFAULT FALSE,
+  close_on_departure BOOLEAN DEFAULT FALSE,
+  minimum_advance_reservation INT DEFAULT NULL,
+  exact_stay_arrival BOOLEAN DEFAULT NULL,
+  maximum_stay INT DEFAULT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+### **3. ota_bookings (or aiosell_bookings / channel_bookings)**
+
+A fallback / canonical store for all bookings coming via channel manager. Should store full detail because OTA payloads are richer than manual walk-in bookings.
+
+Already suggested but needs to include all extra data:
+
+* booking_id (OTA)
+* cm_booking_id
+* channel (OTA name)
+* booked_on (datetime)
+* checkin / checkout
+* guest info (either separate guest table + foreign key, or JSON blob)
+* rooms array: maybe store as JSON or normalize to a child table `ota_booking_rooms` if you want relational integrity
+* per-night price breakdown (e.g. a child table `ota_booking_prices`)
+* status (booked / modified / canceled)
+* raw_payload JSON — always store the original OTA payload for audit
+
+Example skeleton:
+
+```sql
+CREATE TABLE ota_bookings (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  booking_id VARCHAR(100) UNIQUE,
+  cm_booking_id VARCHAR(100),
+  channel VARCHAR(50),
+  booked_on DATETIME,
+  checkin DATE,
+  checkout DATE,
+  status ENUM('book','modify','cancel') DEFAULT 'book',
+  guest_name VARCHAR(255),
+  guest_email VARCHAR(255),
+  guest_phone VARCHAR(50),
+  guest_address JSON,
+  total_amount DECIMAL(10,2),
+  currency VARCHAR(10),
+  nights INT,
+  rooms JSON,
+  price_breakdown JSON,
+  raw_payload JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+### **4. ota_room & rate mappings**
+
+You need mapping tables to match your internal room_type/rateplan to Aiosell’s roomCode and rateplanCode. I've suggested similar before, but ensure it's robust:
+
+* `ota_room_mapping` — maps PMS room types → OTA roomCode
+* `ota_rateplan_mapping` — maps PMS rate plans → OTA rateplanCode
+
+This ensures consistency of names across systems.
+
+### **5. webhook_logs** (for reliability)
+
+To log each webhook call (headers, payload, response) so you can replay or audit.
+
+```sql
+CREATE TABLE webhook_logs (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  endpoint VARCHAR(255),
+  headers JSON,
+  body JSON,
+  response_status INT,
+  received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+---
+
+## ⚠️ Why this extension matters — what happens if you ignore it
+
+If you keep your old simple schema (just rooms, bookings, guests) and **don’t add** these new tables/fields:
+
+* You’ll **lose** critical data coming from OTA (guest address, per-night rates, special requests) — meaning wrong invoices, no guest history, messy audits.
+* You won’t support **rateplan multiple rates per day** — OTA rateplans often differ day to day.
+* You’ll **fail** to enforce restrictions (min-stay, stop-sell) because you can’t store them separately.
+* You’ll have no reliable audit / logs → if anything goes wrong (overbooking, cancellations), you have **no trail** to debug.
+* Your PMS becomes fragile and unable to scale to multiple OTAs / rateplans / complex bookings.
+
+---
+
+## 🔧 What to do **right now** before writing code
+
+1. **Alter your database** to add the 5 tables above (or equivalent)
+2. **Migrate your existing data schema** — ensure `room_type`, `rateplan`, etc. in PMS match mapping tables
+3. **Design JSON vs relational columns** decision: for room nights and price breakdown, likely use JSON to avoid over-normalization (makes webhook parsing simpler)
+4. **Ensure charset / timezone consistency** — OTA payloads use ISO date/time strings, convert properly when storing in MySQL
+
+------------------------------------------------------------------------------
+
+Good — we’re building the microservice. No fluff. Below is a complete, production-capable architecture and implementation plan you can start coding **right now**. I’ll give you:
+
+1. High-level architecture & responsibilities
+2. Exact endpoints and payload expectations
+3. Database tables you’ll need (quick reference)
+4. Folder structure + critical files (ready-to-implement)
+5. Full example code for the core pieces: server, webhook handler, rate/inventory sync, DB service, retry queue worker
+6. Security, logging, monitoring, deployment on **Render** (step-by-step)
+7. Testing and rollout checklist
+
+Work through these in the order shown. I’ll keep it practical and minimal — no unnecessary bells.
+
+---
+
+# 1) High-level architecture (one more time — clean)
+
+* **Microservice (Node + Express)** on Render — always-on, handles OTA talk.
+* **MySQL (Hostinger)** — single source of truth. Microservice reads/writes directly.
+* **PHP UI (Hostinger)** — human interface only; reads DB, triggers sync requests to microservice via HTTP when staff changes rates/inventory.
+* **Aiosell** → sends webhooks to microservice webhook URL.
+* Microservice: validate, dedupe, persist, queue async work, push back to DB, log everything.
+
+Flow examples:
+
+* Rate change in PHP → POST to microservice `/sync/rates` → microservice writes DB + pushes to Aiosell.
+* Aiosell booking webhook → POST to microservice `/webhooks/aiosell/reservation` → microservice validates + saves to `ota_bookings` + pushes into `ota_retry_queue` for any follow up.
+
+---
+
+# 2) Endpoints (minimal, required)
+
+Public endpoints (exposed):
+
+```
+POST /webhooks/aiosell/reservation
+POST /sync/rates
+POST /sync/inventory
+POST /sync/rate-restrictions
+POST /sync/inventory-restrictions
+GET  /health
+POST /admin/retry (manual requeue)
+```
+
+Responsibilities:
+
+* `/webhooks/aiosell/reservation` — Accept reservation payloads from Aiosell. Respond `200 OK` quickly. Validate signature/header.
+* `/sync/*` — Accept requests from PHP (or admin) to push rates/inventory to Aiosell. Validate API key.
+* `/health` — simple 200 OK for uptime checks.
+* `/admin/retry` — optional protected endpoint to re-run failed pushes.
+
+All POST endpoints accept JSON and return `{ success: boolean, message?: string, data?: any }`.
+
+---
+
+# 3) DB tables (quick reference) — implement these in your DB
+
+Minimum tables (we already discussed; here are SQL snippets):
+
+```sql
+-- OTA bookings coming from channel manager
+CREATE TABLE ota_bookings (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  reservation_id VARCHAR(128) UNIQUE,
+  cm_booking_id VARCHAR(128),
+  channel VARCHAR(64),
+  checkin DATE,
+  checkout DATE,
+  guest JSON,
+  rooms JSON,
+  price_breakdown JSON,
+  status ENUM('book','modify','cancel') DEFAULT 'book',
+  raw_payload JSON,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- Logs for inbound webhooks
+CREATE TABLE ota_webhook_logs (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  endpoint VARCHAR(255),
+  headers JSON,
+  body JSON,
+  response_status INT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Mapping PMS <-> OTA
+CREATE TABLE ota_room_mapping (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  property_id INT,
+  pms_room_type VARCHAR(128),
+  ota_room_code VARCHAR(128),
+  channel VARCHAR(64),
+  UNIQUE(property_id, ota_room_code, channel)
+);
+
+CREATE TABLE ota_rate_mapping (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  property_id INT,
+  pms_rate_plan VARCHAR(128),
+  ota_rate_code VARCHAR(128),
+  channel VARCHAR(64),
+  UNIQUE(property_id, ota_rate_code, channel)
+);
+
+-- Retry queue for outbound requests (rates/inventory/acknowledgements)
+CREATE TABLE ota_retry_queue (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  request_type VARCHAR(64),
+  endpoint VARCHAR(255),
+  payload JSON,
+  headers JSON,
+  try_count INT DEFAULT 0,
+  next_try_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Channel settings (store credentials/ids)
+CREATE TABLE channel_settings (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  property_id INT,
+  channel VARCHAR(64),
+  aiosell_hotel_id VARCHAR(128),
+  api_user VARCHAR(128),
+  api_pass VARCHAR(128),
+  last_sync TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Add indexes where necessary (e.g., `reservation_id` unique, `next_try_at` index for retries).
+
+---
+
+# 4) Folder structure (exact)
+
+```
+excoka-ota-service/
+├─ src/
+│  ├─ server.js
+│  ├─ config.js
+│  ├─ routes/
+│  │   ├─ webhooks.routes.js
+│  │   ├─ sync.routes.js
+│  │   └─ admin.routes.js
+│  ├─ controllers/
+│  │   ├─ webhook.controller.js
+│  │   ├─ sync.controller.js
+│  │   └─ admin.controller.js
+│  ├─ services/
+│  │   ├─ db.service.js       // mysql pool + helpers
+│  │   ├─ aiosell.service.js  // wrapper for Aiosell API
+│  │   ├─ queue.service.js    // push into ota_retry_queue
+│  │   └─ worker.js           // retry worker (cron style)
+│  ├─ middlewares/
+│  │   ├─ auth.middleware.js  // protects sync endpoints
+│  │   └─ verify.middleware.js// verify webhook signature if provided
+│  ├─ utils/
+│  │   ├─ logger.js
+│  │   └─ validator.js
+├─ package.json
+├─ .env
+├─ Dockerfile (optional)
+└─ render.yaml (optional)
+```
+
+---
+
+# 5) Key code (copy/paste ready)
+
+Below are trimmed but complete essential files. Use them as the backbone.
+
+### package.json (important deps)
+
+```json
+{
+  "name": "excoka-ota-service",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "worker": "node src/services/worker.js"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "express": "^4.18.2",
+    "mysql2": "^3.3.1",
+    "dotenv": "^16.0.0",
+    "winston": "^3.8.2",
+    "cron": "^2.3.0",
+    "body-parser": "^1.20.2"
+  }
+}
+```
+
+### src/config.js
+
+```js
+import dotenv from 'dotenv';
+dotenv.config();
+
+export default {
+  PORT: process.env.PORT || 5001,
+  DB: {
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+    port: process.env.DB_PORT || 3306
+  },
+  AIOS: {
+    baseUrl: process.env.AIOS_BASE_URL || 'https://live.aiosell.com/api',
+    user: process.env.AIOS_USER,
+    pass: process.env.AIOS_PASS
+  },
+  API_KEY: process.env.SERVICE_API_KEY // used for PHP -> microservice auth
+};
+```
+
+### src/server.js
+
+```js
+import express from 'express';
+import bodyParser from 'body-parser';
+import config from './config.js';
+import webhookRoutes from './routes/webhooks.routes.js';
+import syncRoutes from './routes/sync.routes.js';
+import adminRoutes from './routes/admin.routes.js';
+import logger from './utils/logger.js';
+
+const app = express();
+app.use(bodyParser.json({ limit: '2mb' }));
+
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+app.use('/webhook', webhookRoutes);
+app.use('/sync', syncRoutes);
+app.use('/admin', adminRoutes);
+
+app.listen(config.PORT, () => {
+  logger.info(`OTA microservice up on ${config.PORT}`);
+});
+```
+
+### src/services/db.service.js
+
+```js
+import mysql from 'mysql2/promise';
+import config from '../config.js';
+import logger from '../utils/logger.js';
+
+const pool = mysql.createPool({
+  host: config.DB.host,
+  user: config.DB.user,
+  password: config.DB.password,
+  database: config.DB.database,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+export default {
+  query: async (sql, params=[]) => {
+    const conn = await pool.getConnection();
+    try {
+      const [rows] = await conn.query(sql, params);
+      return rows;
+    } catch (err) {
+      logger.error('DB error', err);
+      throw err;
+    } finally {
+      conn.release();
+    }
+  },
+  getConnection: () => pool.getConnection()
+};
+```
+
+### src/controllers/webhook.controller.js
+
+```js
+import db from '../services/db.service.js';
+import logger from '../utils/logger.js';
+import { enqueueRetry } from '../services/queue.service.js';
+
+export async function aiosellReservation(req, res) {
+  try {
+    // log raw webhook
+    await db.query('INSERT INTO ota_webhook_logs (endpoint, headers, body, response_status) VALUES (?, ?, ?, ?)', [
+      '/webhook/aiosell/reservation',
+      JSON.stringify(req.headers),
+      JSON.stringify(req.body),
+      200
+    ]);
+
+    const payload = req.body;
+    const reservationId = payload.bookingId || payload.reservationId || payload.id;
+
+    // dedupe — if exists update, else insert
+    const existing = await db.query('SELECT id FROM ota_bookings WHERE reservation_id = ?', [reservationId]);
+
+    const insertData = {
+      reservation_id: reservationId,
+      cm_booking_id: payload.cmBookingId || null,
+      channel: 'aiosell',
+      checkin: payload.checkInDate || payload.checkin,
+      checkout: payload.checkOutDate || payload.checkout,
+      guest: JSON.stringify(payload.guest || {}),
+      rooms: JSON.stringify(payload.rooms || []),
+      price_breakdown: JSON.stringify(payload.priceBreakdown || {}),
+      status: payload.action || 'book',
+      raw_payload: JSON.stringify(payload)
+    };
+
+    if (existing.length > 0) {
+      await db.query(`UPDATE ota_bookings SET cm_booking_id = ?, checkin = ?, checkout = ?, guest = ?, rooms = ?, price_breakdown = ?, status = ?, raw_payload = ? WHERE reservation_id = ?`, [
+        insertData.cm_booking_id, insertData.checkin, insertData.checkout, insertData.guest, insertData.rooms, insertData.price_breakdown, insertData.status, insertData.raw_payload, reservationId
+      ]);
+    } else {
+      await db.query(`INSERT INTO ota_bookings (reservation_id, cm_booking_id, channel, checkin, checkout, guest, rooms, price_breakdown, status, raw_payload) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+        insertData.reservation_id, insertData.cm_booking_id, insertData.channel, insertData.checkin, insertData.checkout, insertData.guest, insertData.rooms, insertData.price_breakdown, insertData.status, insertData.raw_payload
+      ]);
+    }
+
+    // quick response so Aiosell knows it was received
+    res.json({ success: true, message: 'Received' });
+
+    // Optionally enqueue post-process tasks (e.g., map to PMS booking, email) by pushing to retry queue
+    // await enqueueRetry('process_booking', '/internal/process_booking', { reservationId });
+
+  } catch (err) {
+    logger.error('webhook error', err);
+    // log failure for reprocessing
+    await db.query('INSERT INTO ota_webhook_logs (endpoint, headers, body, response_status) VALUES (?, ?, ?, ?)', [
+      '/webhook/aiosell/reservation', JSON.stringify(req.headers), JSON.stringify(req.body), 500
+    ]);
+    res.status(500).json({ success: false, error: err.message });
+  }
+}
+```
+
+### src/routes/webhooks.routes.js
+
+```js
+import express from 'express';
+import { aiosellReservation } from '../controllers/webhook.controller.js';
+const router = express.Router();
+
+router.post('/aiosell/reservation', aiosellReservation);
+
+export default router;
+```
+
+### src/services/aiosell.service.js (sample wrapper)
+
+```js
+import axios from 'axios';
+import config from '../config.js';
+
+const base = config.AIOS.baseUrl;
+
+export async function pushInventory(apiUser, apiPass, payload) {
+  const url = `${base}/v2/cm/data/${apiUser}`;
+  const auth = Buffer.from(`${apiUser}:${apiPass}`).toString('base64');
+  const res = await axios.post(url, payload, {
+    headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+    timeout: 15000
+  });
+  return res.data;
+}
+
+export async function pushRates(apiUser, apiPass, payload) {
+  const url = `${base}/v2/cm/data/${apiUser}`;
+  const auth = Buffer.from(`${apiUser}:${apiPass}`).toString('base64');
+  const res = await axios.post(url, payload, {
+    headers: { 'Authorization': `Basic ${auth}`, 'Content-Type': 'application/json' },
+    timeout: 15000
+  });
+  return res.data;
+}
+```
+
+### src/controllers/sync.controller.js (example for inventory)
+
+```js
+import { pushInventory } from '../services/aiosell.service.js';
+import db from '../services/db.service.js';
+import logger from '../utils/logger.js';
+import { enqueueRetry } from '../services/queue.service.js';
+
+export async function syncInventory(req, res) {
+  try {
+    const { property_id, startDate, endDate, rooms } = req.body;
+    const settings = await db.query('SELECT * FROM channel_settings WHERE property_id = ? AND channel = ?', [property_id, 'aiosell']);
+    if (!settings.length) return res.status(400).json({ success:false, message:'No channel settings' });
+
+    const apiUser = settings[0].api_user;
+    const apiPass = settings[0].api_pass;
+
+    const payload = {
+      type: 'inventory',
+      hotelCode: apiUser,
+      startDate,
+      endDate,
+      rooms
+    };
+
+    // push to Aiosell
+    const result = await pushInventory(apiUser, apiPass, payload);
+    // log success
+    await db.query('INSERT INTO channel_logs (property_id, channel, message, payload) VALUES (?, ?, ?, ?)', [
+      property_id, 'aiosell', JSON.stringify(result), JSON.stringify(payload)
+    ]);
+
+    res.json({ success:true, data: result });
+
+  } catch (err) {
+    logger.error('syncInventory error', err);
+    // Add to retry queue
+    await enqueueRetry('inventory', `${config.AIOS.baseUrl}/v2/cm/data/${settings[0].api_user}`, payload);
+    res.status(500).json({ success:false, error:err.message });
+  }
+}
+```
+
+### src/services/queue.service.js (basic enqueue)
+
+```js
+import db from './db.service.js';
+export async function enqueueRetry(request_type, endpoint, payload, headers={}) {
+  await db.query('INSERT INTO ota_retry_queue (request_type, endpoint, payload, headers, try_count) VALUES (?, ?, ?, ?, ?)', [
+    request_type, endpoint, JSON.stringify(payload), JSON.stringify(headers), 0
+  ]);
+}
+```
+
+### src/services/worker.js (cron style)
+
+```js
+import db from './db.service.js';
+import axios from 'axios';
+import config from '../config.js';
+import logger from '../utils/logger.js';
+
+async function processNext() {
+  const rows = await db.query('SELECT * FROM ota_retry_queue WHERE next_try_at <= NOW() ORDER BY next_try_at ASC LIMIT 10');
+  for (const r of rows) {
+    try {
+      const endpoint = r.endpoint;
+      const payload = JSON.parse(r.payload);
+      const headers = JSON.parse(r.headers || '{}');
+      const res = await axios.post(endpoint, payload, { headers, timeout:15000 });
+      // success => delete row
+      await db.query('DELETE FROM ota_retry_queue WHERE id = ?', [r.id]);
+      await db.query('INSERT INTO channel_logs (property_id, channel, message, payload) VALUES (?, ?, ?, ?)', [
+        null, 'aiosell', 'retry success', JSON.stringify({ endpoint, status: res.status, data: res.data })
+      ]);
+    } catch (err) {
+      await db.query('UPDATE ota_retry_queue SET try_count = try_count + 1, next_try_at = DATE_ADD(NOW(), INTERVAL LEAST(POWER(2, try_count), 3600) SECOND) WHERE id = ?', [r.id]);
+      logger.error('retry failed', err.message);
+    }
+  }
+}
+
+setInterval(processNext, 15000); // run every 15s
+```
+
+### src/utils/logger.js
+
+```js
+import winston from 'winston';
+const logger = winston.createLogger({
+  level: 'info',
+  transports: [
+    new winston.transports.Console(),
+  ]
+});
+export default logger;
+```
+
+---
+
+# 6) Security + validation
+
+* Use **basic auth** for Aiosell pushes (they do Basic). Store credentials in `channel_settings` table.
+* Use **API_KEY** (in `config.SERVICE_API_KEY`) for PHP → microservice calls (header `x-service-key`).
+* Validate inbound webhook origin via IP whitelist if provided by Aiosell, and also save raw payload for auditing.
+* Rate-limit `webhooks` endpoint if needed.
+* Sanitize all DB writes; use parameterized queries (done via mysql2/promise).
+
+---
+
+# 7) Deployment on Render — exact steps
+
+1. Create GitHub repo and push this code.
+2. Sign into Render, click **New → Web Service** → connect repo.
+3. Branch: `main`
+4. Build command: `npm install`
+5. Start command: `npm start`
+6. Set ENV vars in Render dashboard: `DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME`, `AIOS_BASE_URL`, `AIOS_USER`, `AIOS_PASS`, `SERVICE_API_KEY`
+7. Deploy. Render gives you a stable HTTPS URL (e.g., `https://excoka-ota.onrender.com`).
+8. Add a background worker on Render (New → Background Worker) to run: `npm run worker` (this runs retry worker).
+9. Put webhook URL into Aiosell: `https://excoka-ota.onrender.com/webhook/aiosell/reservation`
+
+---
+
+# 8) Monitoring & reliability
+
+* Add logging to channel_logs & webhook_logs (already present).
+* Add a /health endpoint and use Render health checks to auto-restart.
+* Set up alerts: connect Render to Slack or email for failed deploys.
+* Use the retry queue (essential) to survive temporary Aiosell downtime.
+
+---
+
+# 9) Testing plan (do this before demo)
+
+1. Local dev: run with `.env` pointing to a local MySQL. Use ngrok to expose local `/webhook/aiosell/reservation` to Aiosell sandbox if needed.
+2. Test push rates/inventory from Postman with sandbox creds — expect `Request Received Successfully`.
+3. Hook Aiosell sandbox to your Render webhook and ask them to push sample reservations; verify they appear in `ota_bookings` and `ota_webhook_logs`.
+4. Simulate Aiosell downtime by shutting down microservice; check retry queue entries get pushed and retried.
+5. Test PHP → microservice flows: change price in PHP UI → call `/sync/rates` -> Confirm in channel_logs that push succeeded.
+
+---
+
+# 10) Rollout checklist before you tell Aiosell “ready”
+
+* [ ] Deploy microservice on Render and set ENV vars
+* [ ] Create DB tables in production DB (run migrations)
+* [ ] Create channel_settings entry for sandbox property with credentials
+* [ ] Test `POST /sync/rates` and `POST /sync/inventory` using sandbox creds (expect success)
+* [ ] Provide webhook URL and test inbound reservations from Aiosell sandbox
+* [ ] Validate mapping of OTA room codes to PMS rooms
+* [ ] Turn on worker process for retries
+* [ ] Set monitoring and backup
+
+---
+
+# Next concrete step I will deliver if you want:
+
+I can generate the **complete repo zip** (all files above, ready to run) and a **SQL migration file** that creates the tables (so you can run it on your Hostinger DB). Say the word: **“generate repo + SQL”** and I’ll produce both in the next message.
+
+If you want to code it yourself, start by implementing `server.js`, `db.service.js`, and `webhook.controller.js` — deploy to Render and give Aiosell the webhook. Then implement `aiosell.service.js` + `/sync` endpoints.
+
+Which do you want me to do next — generate the full repo + SQL migration, or start with just the webhook handler and DB migration SQL?
+
