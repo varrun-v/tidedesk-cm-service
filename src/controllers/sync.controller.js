@@ -19,21 +19,21 @@ export async function syncInventoryToAiosell(req, res) {
 
     // 3. PREPARE PAYLOAD
     const payload = {
-        hotelCode: property_id,
-        updates: [{
-            startDate: startDate,
-            endDate: endDate,
-            rooms: [{ roomCode: otaRoomCode, available: parseInt(availability) }]
-        }]
+      hotelCode: property_id,
+      updates: [{
+        startDate: startDate,
+        endDate: endDate,
+        rooms: [{ roomCode: otaRoomCode, available: parseInt(availability) }]
+      }]
     };
 
     // 4. SEND TO AIOSELL
     const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
     const response = await axios.post(`${config.AIOS.baseUrl}/v2/cm/update/${api_user}`, payload, {
-        headers: { 
-            'Authorization': `Basic ${auth}`,
-            'Content-Type': 'application/json' 
-        }
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      }
     });
 
     res.json({ success: true, aiosell_response: response.data });
