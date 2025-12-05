@@ -2,45 +2,121 @@ import axios from 'axios';
 import db from '../services/db.service.js';
 import config from '../config.js';
 
-export async function syncInventoryToAiosell(req, res) {
-  // PHP sends: { "roomId": 15, "startDate": "2025-10-01", "endDate": "2025-10-02", "availability": 5 }
-  const { roomId, startDate, endDate, availability } = req.body;
+// --- SHARED HELPER: PUSH TO AIOSELL ---
+async function pushToAiosell(payload, type) {
+  // 1. GET CREDENTIALS
+  const settings = await db.query("SELECT * FROM channel_settings WHERE channel = 'aiosell' LIMIT 1");
+  if (!settings.length) throw new Error("Channel settings not found");
+  const { api_user, api_pass } = settings[0];
+
+  // 2. SEND TO AIOSELL
+  const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
+  const url = `${config.AIOS.baseUrl}/v2/cm/update/${api_user}`;
 
   try {
-    // 1. GET CREDENTIALS
-    const settings = await db.query("SELECT * FROM channel_settings WHERE channel = 'aiosell' LIMIT 1");
-    if (!settings.length) throw new Error("Channel settings not found");
-    const { api_user, api_pass, property_id } = settings[0];
+    const response = await axios.post(url, payload, {
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000 // 15s timeout
+    });
+    return response.data;
+  } catch (error) {
+    // Enhance error message
+    const msg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
+    throw new Error(`Aiosell API Error (${type}): ${msg}`);
+  }
+}
 
-    // 2. GET MAPPING (Convert PMS ID 15 -> 'DELUXE_SEA')
-    const mapping = await db.query("SELECT ota_room_code FROM ota_room_mapping WHERE pms_room_id = ?", [roomId]);
-    if (!mapping.length) throw new Error(`Mapping not found for Room ID ${roomId}`);
-    const otaRoomCode = mapping[0].ota_room_code;
+// --- HELPER: RESOLVE ROOM CODE ---
+async function getOtaRoomCode(pmsRoomId) {
+  const mapping = await db.query("SELECT ota_room_code FROM ota_room_mapping WHERE pms_room_id = ?", [pmsRoomId]);
+  if (!mapping.length) throw new Error(`Mapping not found for Room ID ${pmsRoomId}`);
+  return mapping[0].ota_room_code;
+}
 
-    // 3. PREPARE PAYLOAD
+// --- 1. SYNC INVENTORY ---
+export async function syncInventoryToAiosell(req, res) {
+  try {
+    const { roomId, startDate, endDate, availability } = req.body;
+    const otaRoomCode = await getOtaRoomCode(roomId);
+
     const payload = {
-      hotelCode: property_id,
       updates: [{
-        startDate: startDate,
-        endDate: endDate,
+        startDate,
+        endDate,
         rooms: [{ roomCode: otaRoomCode, available: parseInt(availability) }]
       }]
     };
 
-    // 4. SEND TO AIOSELL
-    const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
-    const response = await axios.post(`${config.AIOS.baseUrl}/v2/cm/update/${api_user}`, payload, {
-      headers: {
-        'Authorization': `Basic ${auth}`,
-        'Content-Type': 'application/json'
-      }
-    });
-
-    res.json({ success: true, aiosell_response: response.data });
+    const result = await pushToAiosell(payload, 'Inventory');
+    res.json({ success: true, data: result });
 
   } catch (error) {
-    console.error("Sync Failed:", error.message);
-    // OPTIONAL: Insert into retry_queue here if it fails
+    console.error("Sync Inventory Failed:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+}
+
+// --- 2. SYNC RATES ---
+export async function syncRatesToAiosell(req, res) {
+  try {
+    const { roomId, startDate, endDate, price, ratePlanId } = req.body;
+    const otaRoomCode = await getOtaRoomCode(roomId);
+
+    // Optional: Map ratePlanId if you have multiple rate plans
+    // const ratePlanCode = await getOtaRateCode(ratePlanId); 
+    // For now, we assume default or send without ratePlanCode if Aiosell allows, 
+    // OR you can pass ratePlanCode directly if your PMS knows it.
+
+    const payload = {
+      updates: [{
+        startDate,
+        endDate,
+        rooms: [{
+          roomCode: otaRoomCode,
+          price: parseFloat(price)
+          // ratePlanCode: "BAR" // Add this if needed
+        }]
+      }]
+    };
+
+    const result = await pushToAiosell(payload, 'Rates');
+    res.json({ success: true, data: result });
+
+  } catch (error) {
+    console.error("Sync Rates Failed:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+}
+
+// --- 3. SYNC RESTRICTIONS ---
+export async function syncRestrictionsToAiosell(req, res) {
+  try {
+    const { roomId, startDate, endDate, stopSell, minStay, maxStay, closeOnArrival, closeOnDeparture } = req.body;
+    const otaRoomCode = await getOtaRoomCode(roomId);
+
+    const payload = {
+      updates: [{
+        startDate,
+        endDate,
+        rooms: [{
+          roomCode: otaRoomCode,
+          stopSell: stopSell === true || stopSell === 'true',
+          minStay: minStay ? parseInt(minStay) : undefined,
+          maxStay: maxStay ? parseInt(maxStay) : undefined,
+          closeOnArrival: closeOnArrival === true,
+          closeOnDeparture: closeOnDeparture === true
+        }]
+      }]
+    };
+
+    const result = await pushToAiosell(payload, 'Restrictions');
+    res.json({ success: true, data: result });
+
+  } catch (error) {
+    console.error("Sync Restrictions Failed:", error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 }
