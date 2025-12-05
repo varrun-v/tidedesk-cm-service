@@ -1,5 +1,233 @@
 import db from '../services/db.service.js';
 
+// --- AIosell Inventory Push Handler ---
+export async function handleAiosellInventory(req, res) {
+    try {
+        const payload = req.body;
+
+        // SECURITY: Verify Signature (if required, similar to reservation)
+        const signature = req.headers['x-aiosell-token'];
+        if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
+            console.warn("Unauthorized Inventory Webhook Attempt");
+            return res.status(403).json({ success: false, error: "Unauthorized" });
+        }
+
+        // LOG IT (optional, for traceability)
+        try {
+            await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
+                ['/webhook/aiosell/inventory', JSON.stringify(payload), 200]);
+        } catch (logErr) {
+            console.error("Failed to log inventory webhook:", logErr.message);
+        }
+
+        // Validate payload
+        if (!payload.hotelCode || !Array.isArray(payload.updates)) {
+            return res.status(400).json({ success: false, error: 'Invalid payload' });
+        }
+
+        // Process each update
+        for (const update of payload.updates) {
+            const { startDate, endDate, rooms } = update;
+            if (!startDate || !endDate || !Array.isArray(rooms)) continue;
+
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                const dateStr = d.toISOString().split('T')[0];
+                for (const room of rooms) {
+                    // Map OTA roomCode to PMS room_id
+                    const mapping = await db.query('SELECT pms_room_id FROM ota_room_mapping WHERE ota_room_code = ?', [room.roomCode]);
+                    if (mapping.length > 0) {
+                        const pmsRoomId = mapping[0].pms_room_id;
+                        // Update inventory for this date and room
+                        await db.query(
+                            'UPDATE inventory SET available_count = ? WHERE room_id = ? AND date = ?',
+                            [room.available, pmsRoomId, dateStr]
+                        );
+                    }
+                }
+            }
+        }
+
+        res.json({ success: true, message: 'Inventory updated successfully' });
+    } catch (error) {
+        console.error("Inventory Push Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}
+
+// --- AIosell Rates Push Handler ---
+export async function handleAiosellRates(req, res) {
+    try {
+        const payload = req.body;
+
+        // SECURITY: Verify Signature (if required)
+        const signature = req.headers['x-aiosell-token'];
+        if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
+            console.warn("Unauthorized Rates Webhook Attempt");
+            return res.status(403).json({ success: false, error: "Unauthorized" });
+        }
+
+        // LOG IT (optional)
+        try {
+            await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
+                ['/webhook/aiosell/rates', JSON.stringify(payload), 200]);
+        } catch (logErr) {
+            console.error("Failed to log rates webhook:", logErr.message);
+        }
+
+        // Validate payload
+        if (!payload.hotelCode || !Array.isArray(payload.updates)) {
+            return res.status(400).json({ success: false, error: 'Invalid payload' });
+        }
+
+        // Process each update
+        for (const update of payload.updates) {
+            const { startDate, endDate, rates } = update;
+            if (!startDate || !endDate || !Array.isArray(rates)) continue;
+
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                const dateStr = d.toISOString().split('T')[0];
+                for (const rateObj of rates) {
+                    // Map OTA roomCode to PMS room_id
+                    const mapping = await db.query('SELECT pms_room_id FROM ota_room_mapping WHERE ota_room_code = ?', [rateObj.roomCode]);
+                    if (mapping.length > 0) {
+                        const pmsRoomId = mapping[0].pms_room_id;
+                        // Update rates for this date, room, and rateplan
+                        await db.query(
+                            'UPDATE rates SET rate = ? WHERE room_id = ? AND rateplan_code = ? AND date = ?',
+                            [rateObj.rate, pmsRoomId, rateObj.rateplanCode, dateStr]
+                        );
+                    }
+                }
+            }
+        }
+
+        res.json({ success: true, message: 'Rates updated successfully' });
+    } catch (error) {
+        console.error("Rates Push Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}
+
+// --- AIosell Inventory Restrictions Push Handler ---
+export async function handleAiosellInventoryRestrictions(req, res) {
+    try {
+        const payload = req.body;
+
+        // SECURITY: Verify Signature (if required)
+        const signature = req.headers['x-aiosell-token'];
+        if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
+            console.warn("Unauthorized Inventory Restrictions Webhook Attempt");
+            return res.status(403).json({ success: false, error: "Unauthorized" });
+        }
+
+        // LOG IT (optional)
+        try {
+            await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
+                ['/webhook/aiosell/inventory-restrictions', JSON.stringify(payload), 200]);
+        } catch (logErr) {
+            console.error("Failed to log inventory restrictions webhook:", logErr.message);
+        }
+
+        // Validate payload (assume similar structure to inventory/rates)
+        if (!payload.hotelCode || !Array.isArray(payload.updates)) {
+            return res.status(400).json({ success: false, error: 'Invalid payload' });
+        }
+
+        // Process each update
+        for (const update of payload.updates) {
+            const { startDate, endDate, restrictions } = update;
+            if (!startDate || !endDate || !Array.isArray(restrictions)) continue;
+
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                const dateStr = d.toISOString().split('T')[0];
+                for (const restr of restrictions) {
+                    // Map OTA roomCode to PMS room_id
+                    const mapping = await db.query('SELECT pms_room_id FROM ota_room_mapping WHERE ota_room_code = ?', [restr.roomCode]);
+                    if (mapping.length > 0) {
+                        const pmsRoomId = mapping[0].pms_room_id;
+                        // Update inventory_restrictions for this date and room
+                        await db.query(
+                            `INSERT INTO inventory_restrictions (room_type, start_date, end_date, stop_sell, minimum_stay, close_on_arrival, close_on_departure, minimum_advance_reservation, exact_stay_arrival, maximum_stay, updated_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                             ON DUPLICATE KEY UPDATE stop_sell=VALUES(stop_sell), minimum_stay=VALUES(minimum_stay), close_on_arrival=VALUES(close_on_arrival), close_on_departure=VALUES(close_on_departure), minimum_advance_reservation=VALUES(minimum_advance_reservation), exact_stay_arrival=VALUES(exact_stay_arrival), maximum_stay=VALUES(maximum_stay), updated_at=NOW()`,
+                            [restr.roomCode, dateStr, dateStr, restr.stopSell || false, restr.minimumStay || null, restr.closeOnArrival || false, restr.closeOnDeparture || false, restr.minimumAdvanceReservation || null, restr.exactStayArrival || null, restr.maximumStay || null]
+                        );
+                    }
+                }
+            }
+        }
+
+        res.json({ success: true, message: 'Inventory restrictions updated successfully' });
+    } catch (error) {
+        console.error("Inventory Restrictions Push Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}
+
+// --- AIosell Rate Restrictions Push Handler ---
+export async function handleAiosellRateRestrictions(req, res) {
+    try {
+        const payload = req.body;
+
+        // SECURITY: Verify Signature (if required)
+        const signature = req.headers['x-aiosell-token'];
+        if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
+            console.warn("Unauthorized Rate Restrictions Webhook Attempt");
+            return res.status(403).json({ success: false, error: "Unauthorized" });
+        }
+
+        // LOG IT (optional)
+        try {
+            await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
+                ['/webhook/aiosell/rate-restrictions', JSON.stringify(payload), 200]);
+        } catch (logErr) {
+            console.error("Failed to log rate restrictions webhook:", logErr.message);
+        }
+
+        // Validate payload (assume similar structure)
+        if (!payload.hotelCode || !Array.isArray(payload.updates)) {
+            return res.status(400).json({ success: false, error: 'Invalid payload' });
+        }
+
+        // Process each update
+        for (const update of payload.updates) {
+            const { startDate, endDate, restrictions } = update;
+            if (!startDate || !endDate || !Array.isArray(restrictions)) continue;
+
+            const start = new Date(startDate);
+            const end = new Date(endDate);
+            for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+                const dateStr = d.toISOString().split('T')[0];
+                for (const restr of restrictions) {
+                    // Map OTA roomCode to PMS room_id
+                    const mapping = await db.query('SELECT pms_room_id FROM ota_room_mapping WHERE ota_room_code = ?', [restr.roomCode]);
+                    if (mapping.length > 0) {
+                        const pmsRoomId = mapping[0].pms_room_id;
+                        // Update rate_restrictions for this date, room, and rateplan
+                        await db.query(
+                            `INSERT INTO rate_restrictions (room_type, rateplan_code, start_date, end_date, min_los, max_los, closed, closed_on_arrival, closed_on_departure, updated_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                             ON DUPLICATE KEY UPDATE min_los=VALUES(min_los), max_los=VALUES(max_los), closed=VALUES(closed), closed_on_arrival=VALUES(closed_on_arrival), closed_on_departure=VALUES(closed_on_departure), updated_at=NOW()`,
+                            [restr.roomCode, restr.rateplanCode || null, dateStr, dateStr, restr.minLos || null, restr.maxLos || null, restr.closed || false, restr.closedOnArrival || false, restr.closedOnDeparture || false]
+                        );
+                    }
+                }
+            }
+        }
+
+        res.json({ success: true, message: 'Rate restrictions updated successfully' });
+    } catch (error) {
+        console.error("Rate Restrictions Push Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}
+
 export async function handleAiosellBooking(req, res) {
     try {
         const payload = req.body;
