@@ -3,6 +3,11 @@ node_modules/
 package-lock.json
 yarn.lock
 
+reference_repo/
+CODEBASE_EXPLANATION.md
+TESTING.md
+architecture.txt
+
 # Environment
 .env
 .env.local
