@@ -2,9 +2,7 @@ import axios from 'axios';
 import db from '../services/db.service.js';
 import config from '../config.js';
 
-import axios from 'axios';
-import db from '../services/db.service.js';
-import config from '../config.js';
+
 
 // --- CORE LOGIC: PUSH TO AIOSELL ---
 export async function pushToAiosell(payload, type) {
