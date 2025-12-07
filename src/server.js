@@ -2,6 +2,7 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import config from './config.js';
 import webhookRoutes from './routes/webhooks.routes.js';
+import './services/worker.js'; // Start the Polling Worker
 
 const app = express();
 app.use(bodyParser.json());
