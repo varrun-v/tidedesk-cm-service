@@ -2,12 +2,12 @@ import db from '../services/db.service.js';
 
 // --- Unused handlers removed ---
 
-export async function handleAiosellBooking(req, res) {
+export async function handleChannelManagerBooking(req, res) {
     try {
         const payload = req.body;
 
         // 0. SECURITY: Verify Signature
-        const signature = req.headers['x-aiosell-token'];
+        const signature = req.headers['x-aiosell-token']; // Keep header key as is for now
         if (process.env.AIOSELL_WEBHOOK_SECRET && signature !== process.env.AIOSELL_WEBHOOK_SECRET) {
             console.warn("Unauthorized Webhook Attempt");
             return res.status(403).json({ success: false, error: "Unauthorized" });
@@ -17,7 +17,7 @@ export async function handleAiosellBooking(req, res) {
         // We wrap this in its own try/catch so logging failure doesn't block the booking
         try {
             await db.query('INSERT INTO ota_webhook_logs (endpoint, body, response_status) VALUES (?, ?, ?)',
-                ['/webhook/aiosell', JSON.stringify(payload), 200]);
+                ['/webhook/channel-manager', JSON.stringify(payload), 200]);
         } catch (logErr) {
             console.error("Failed to log webhook:", logErr.message);
             // Continue processing even if logging fails
@@ -32,7 +32,7 @@ export async function handleAiosellBooking(req, res) {
         const bookingData = [
             reservationId,
             payload.cmBookingId || null,
-            'aiosell',
+            'channel_manager', // Generic channel name
             payload.checkInDate,
             payload.checkOutDate,
             JSON.stringify(payload.guest || {}),
@@ -56,7 +56,7 @@ export async function handleAiosellBooking(req, res) {
         // This function assumes you have an 'inventory' table in your PMS
         await updateLocalInventory(payload, action);
 
-        // 4. Respond to Aiosell
+        // 4. Respond to Channel Manager
         res.json({ success: true, message: 'Booking processed and inventory updated' });
 
     } catch (error) {

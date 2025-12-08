@@ -7,7 +7,7 @@ import './services/worker.js'; // Start the Polling Worker
 const app = express();
 app.use(bodyParser.json());
 
-// 1. Webhook for Aiosell (The URL you give them)
+// 1. Webhook for Channel Manager (The URL you give them)
 app.use('/webhooks', webhookRoutes);
 
 // 2. Sync Endpoints (REMOVED: Now using Polling Architecture via ota_sync_queue)

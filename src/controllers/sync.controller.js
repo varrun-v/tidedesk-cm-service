@@ -4,16 +4,17 @@ import config from '../config.js';
 
 
 
-// --- CORE LOGIC: PUSH TO AIOSELL ---
-export async function pushToAiosell(payload, type) {
+// --- CORE LOGIC: PUSH TO CHANNEL MANAGER ---
+export async function pushToChannelManager(payload, type) {
   // 1. GET CREDENTIALS
+  // We keep 'aiosell' as the channel key in DB for now to preserve data compatibility
   const settings = await db.query("SELECT * FROM channel_settings WHERE channel = 'aiosell' LIMIT 1");
   if (!settings.length) throw new Error("Channel settings not found");
   const { api_user, api_pass } = settings[0];
 
-  // 2. SEND TO AIOSELL
+  // 2. SEND TO CHANNEL MANAGER
   const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
-  const url = `${config.AIOS.baseUrl}/v2/cm/update/${api_user}`;
+  const url = `${config.CM.baseUrl}/v2/cm/update/${api_user}`;
 
   try {
     const response = await axios.post(url, payload, {
@@ -27,7 +28,7 @@ export async function pushToAiosell(payload, type) {
   } catch (error) {
     // Enhance error message
     const msg = error.response?.data ? JSON.stringify(error.response.data) : error.message;
-    throw new Error(`Aiosell API Error (${type}): ${msg}`);
+    throw new Error(`Channel Manager API Error (${type}): ${msg}`);
   }
 }
 

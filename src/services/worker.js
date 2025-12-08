@@ -2,7 +2,7 @@ import db from './db.service.js';
 import axios from 'axios';
 import config from '../config.js';
 
-import { pushToAiosell, buildInventoryPayload, buildRatesPayload, buildRestrictionsPayload } from '../controllers/sync.controller.js';
+import { pushToChannelManager, buildInventoryPayload, buildRatesPayload, buildRestrictionsPayload } from '../controllers/sync.controller.js';
 
 async function processSyncQueue() {
   // 1. Fetch PENDING items
@@ -26,9 +26,9 @@ async function processSyncQueue() {
         payload = await buildRestrictionsPayload(row.room_id, startDate, endDate, row.payload);
       }
 
-      // Push to Aiosell
+      // Push to Channel Manager
       if (payload) {
-        await pushToAiosell(payload, row.type);
+        await pushToChannelManager(payload, row.type);
       }
 
       // Success: Delete the row (or move to history if you prefer)
@@ -54,7 +54,7 @@ async function processNext() {
       // success => delete row
       await db.query('DELETE FROM ota_retry_queue WHERE id = ?', [r.id]);
       await db.query('INSERT INTO channel_logs (property_id, channel, message, payload) VALUES (?, ?, ?, ?)', [
-        null, 'aiosell', 'retry success', JSON.stringify({ endpoint, status: res.status, data: res.data })
+        null, 'channel_manager', 'retry success', JSON.stringify({ endpoint, status: res.status, data: res.data })
       ]);
     } catch (err) {
       await db.query('UPDATE ota_retry_queue SET try_count = try_count + 1, next_try_at = DATE_ADD(NOW(), INTERVAL LEAST(POWER(2, try_count), 3600) SECOND) WHERE id = ?', [r.id]);
@@ -85,3 +85,6 @@ setInterval(processSyncQueue, 10000);
 setInterval(cleanupZombies, 24 * 60 * 60 * 1000);
 
 console.log('Worker started: Sync Queue + Retry Queue + Zombie Cleaner');
+
+// Heartbeat to confirm worker is alive (useful for debugging Render logs)
+setInterval(() => console.log('Worker Heartbeat: I am alive...'), 30000);

@@ -1,8 +1,9 @@
 import express from 'express';
-import { handleAiosellBooking } from '../controllers/webhook.controller.js';
+import { handleChannelManagerBooking } from '../controllers/webhook.controller.js';
+
 const router = express.Router();
 
-
-router.post('/aiosell/reservation', handleAiosellBooking);
+// 1. Booking Notification (Aiosell -> PMS)
+router.post('/reservation', handleChannelManagerBooking);
 
 export default router;
