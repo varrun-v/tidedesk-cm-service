@@ -31,7 +31,15 @@ async function processSyncQueue() {
         await pushToChannelManager(payload, row.type);
       }
 
-      // Success: Delete the row (or move to history if you prefer)
+      // Success: Move to History
+      await db.query(
+        `INSERT INTO ota_sync_history 
+        (original_queue_id, type, room_id, start_date, end_date, payload, status, created_at, retry_count) 
+        VALUES (?, ?, ?, ?, ?, ?, 'COMPLETED', ?, ?)`,
+        [row.id, row.type, row.room_id, row.start_date, row.end_date, row.payload, row.created_at, row.retry_count]
+      );
+
+      // Delete from Queue
       await db.query('DELETE FROM ota_sync_queue WHERE id = ?', [row.id]);
       console.log(`Sync Success [${row.type}] ID: ${row.id}`);
 
