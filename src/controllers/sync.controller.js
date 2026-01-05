@@ -16,8 +16,14 @@ export async function pushToChannelManager(payload, type) {
   const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
   const url = `${config.CM.baseUrl}/v2/cm/update/${api_user}`;
 
+  // Inject hotelCode into the payload as required by the API
+  const finalPayload = {
+    hotelCode: api_user,
+    ...payload
+  };
+
   try {
-    const response = await axios.post(url, payload, {
+    const response = await axios.post(url, finalPayload, {
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json'
