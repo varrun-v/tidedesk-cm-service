@@ -16,6 +16,11 @@ export async function pushToChannelManager(payload, type) {
   const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
   const url = `${config.CM.baseUrl}/v2/cm/update/${api_user}`;
 
+  // Inject hotelCode if missing (assuming api_user is hotelCode)
+  if (payload && !payload.hotelCode) {
+    payload.hotelCode = api_user;
+  }
+
   try {
     const response = await axios.post(url, payload, {
       headers: {
@@ -39,6 +44,16 @@ export async function getOtaRoomCode(pmsRoomId) {
   return mapping[0].ota_room_code;
 }
 
+// --- HELPER: RESOLVE RATE PLAN CODE ---
+export async function getOtaRatePlanCode(pmsRoomId, pmsRatePlanId) {
+  const mapping = await db.query(
+    "SELECT ota_rate_plan_code FROM ota_rate_plan_mapping WHERE pms_room_id = ? AND pms_rate_plan_id = ?",
+    [pmsRoomId, pmsRatePlanId]
+  );
+  if (!mapping.length) throw new Error(`Rate Plan mapping not found for Room ${pmsRoomId} and Rate Plan ${pmsRatePlanId}`);
+  return mapping[0].ota_rate_plan_code;
+}
+
 // --- PAYLOAD BUILDERS (Used by Worker) ---
 
 export async function buildInventoryPayload(roomId, startDate, endDate, payloadJson) {
@@ -56,13 +71,21 @@ export async function buildInventoryPayload(roomId, startDate, endDate, payloadJ
 export async function buildRatesPayload(roomId, startDate, endDate, payloadJson) {
   const otaRoomCode = await getOtaRoomCode(roomId);
   const data = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
+
+  if (!data.ratePlanId) {
+    throw new Error("Rate Plan ID is required for Rate updates. Payload: " + JSON.stringify(data));
+  }
+
+  const otaRatePlanCode = await getOtaRatePlanCode(roomId, data.ratePlanId);
+
   return {
     updates: [{
       startDate,
       endDate,
-      rooms: [{
+      rates: [{
         roomCode: otaRoomCode,
-        price: parseFloat(data.price)
+        rate: parseFloat(data.rate || data.price),
+        rateplanCode: otaRatePlanCode
       }]
     }]
   };
