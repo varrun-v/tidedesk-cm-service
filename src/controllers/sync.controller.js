@@ -7,23 +7,38 @@ import config from '../config.js';
 // --- CORE LOGIC: PUSH TO CHANNEL MANAGER ---
 export async function pushToChannelManager(payload, type) {
   // 1. GET CREDENTIALS
-  // We keep 'aiosell' as the channel key in DB for now to preserve data compatibility
   const settings = await db.query("SELECT * FROM channel_settings WHERE channel = 'aiosell' LIMIT 1");
   if (!settings.length) throw new Error("Channel settings not found");
-  const { api_user, api_pass } = settings[0];
+  const { api_user, api_pass, property_id } = settings[0]; // property_id is hotelCode
 
-  // 2. SEND TO CHANNEL MANAGER
+  // 2. CONSTRUCT URL & AUTH
   const auth = Buffer.from(`${api_user}:${api_pass}`).toString('base64');
-  const url = `${config.CM.baseUrl}/v2/cm/update/${api_user}`;
 
-  // Inject hotelCode into the payload as required by the API
+  // URL Bases
+  const baseUrl = config.CM.baseUrl; // e.g. https://live.aiosell.com/api
+
+  // SELECT ENDPOINT BASED ON TYPE
+  let endpoint = '';
+  if (type === 'RATES') {
+    endpoint = `${baseUrl}/v2/cm/update-rates/${api_user}`;
+  } else {
+    // INVENTORY and RESTRICTIONS use the standard update endpoint
+    endpoint = `${baseUrl}/v2/cm/update/${api_user}`;
+  }
+
+  // Inject hotelCode (property_id) into the payload top-level
   const finalPayload = {
-    hotelCode: api_user,
+    hotelCode: property_id,
     ...payload
   };
 
+  console.log(`--- SYNC DEBUG [${type}] ---`);
+  console.log('Endpoint:', endpoint);
+  console.log(JSON.stringify(finalPayload, null, 2));
+  console.log('------------------------');
+
   try {
-    const response = await axios.post(url, finalPayload, {
+    const response = await axios.post(endpoint, finalPayload, {
       headers: {
         'Authorization': `Basic ${auth}`,
         'Content-Type': 'application/json'
@@ -50,11 +65,16 @@ export async function getOtaRoomCode(pmsRoomId) {
 export async function buildInventoryPayload(roomId, startDate, endDate, payloadJson) {
   const otaRoomCode = await getOtaRoomCode(roomId);
   const data = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
+
+  // matches: "rooms": [{ "available": 3, "roomCode": "code" }]
   return {
     updates: [{
       startDate,
       endDate,
-      rooms: [{ roomCode: otaRoomCode, available: parseInt(data.availability) }]
+      rooms: [{
+        roomCode: otaRoomCode,
+        available: parseInt(data.availability)
+      }]
     }]
   };
 }
@@ -65,19 +85,15 @@ export async function buildRatesPayload(roomId, startDate, endDate, payloadJson)
 
   const ratePayload = {
     roomCode: otaRoomCode,
-    rate: parseFloat(data.price) // Maps 'price' from PMS to 'rate' for CM
+    rateplanCode: data.ratePlanCode, // Mandatory for rates
+    rate: parseFloat(data.price)
   };
-
-  // Add ratePlanCode if present (lowercase key as per API)
-  if (data.ratePlanCode) {
-    ratePayload.rateplanCode = data.ratePlanCode;
-  }
 
   return {
     updates: [{
       startDate,
       endDate,
-      rates: [ratePayload] // Uses 'rates' instead of 'rooms'
+      rates: [ratePayload] // strictly "rates" array
     }]
   };
 }
@@ -85,6 +101,8 @@ export async function buildRatesPayload(roomId, startDate, endDate, payloadJson)
 export async function buildRestrictionsPayload(roomId, startDate, endDate, payloadJson) {
   const otaRoomCode = await getOtaRoomCode(roomId);
   const data = typeof payloadJson === 'string' ? JSON.parse(payloadJson) : payloadJson;
+
+  // Restrictions go to standard update endpoint, inside "rooms"
   return {
     updates: [{
       startDate,
